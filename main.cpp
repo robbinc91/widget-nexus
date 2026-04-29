@@ -43,6 +43,11 @@ static HINSTANCE g_hInstance = nullptr;
 static HWND g_nexusHwnd = nullptr;
 static bool g_trayIconAdded = false;
 static HICON g_trayIcon = nullptr;
+static HICON g_windowIcon = nullptr;
+static HICON g_windowIconSm = nullptr;
+
+static constexpr const char kAppVersion[] = "0.2.0";
+static constexpr const char kAppRepoUrl[] = "https://github.com/robbinc91/widget-nexus";
 
 static constexpr UINT WM_APP_TRAY = WM_USER + 101;
 static constexpr const char FLOATER_CLASS_NAME[] = "NexusFloaterWnd";
@@ -55,6 +60,21 @@ static constexpr int kFloaterDragRingPx = 12;
 static constexpr int kFloaterGap = 8;
 static constexpr int kFloaterMargin = 10;
 static constexpr BYTE kFloaterAlpha = 200; // layered window opacity (0 = invisible, 255 = opaque)
+
+static constexpr UINT_PTR IDT_FLOATER_ANIM = WM_USER + 150;
+static constexpr UINT kFloaterAnimIntervalMs = 22;
+static constexpr BYTE kFloaterAnimStep = 32;
+static constexpr BYTE kGroupPulseLowAlpha = 118;
+
+enum class FloaterAnimKind : unsigned char { FadeIn, FadeOut, PulseDown, PulseUp };
+
+struct FloaterAnim {
+    HWND hwnd = nullptr;
+    BYTE alpha = 0;
+    FloaterAnimKind kind = FloaterAnimKind::FadeIn;
+};
+
+static std::vector<FloaterAnim> g_floaterAnims;
 
 enum ControlIds {
     IDC_SHOW_NON_PINNED = 101,
@@ -99,8 +119,8 @@ static HFONT g_fontUi = nullptr;
 static HFONT g_fontMono = nullptr;
 static int g_listItemHeight = 40;
 
-static HICON CreateNeonTrayIcon() {
-    const int s = 16;
+static HICON CreateNeonWlIcon(int pixelSize) {
+    const int s = std::max(8, pixelSize);
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
     HBITMAP color = CreateCompatibleBitmap(screen, s, s);
@@ -111,16 +131,18 @@ static HICON CreateNeonTrayIcon() {
     FillRect(mem, &rc, bg);
     DeleteObject(bg);
 
-    HPEN neon = CreatePen(PS_SOLID, 1, RGB(255, 80, 240));
+    const int corner = std::max(2, (s * 6) / 16);
+    HPEN neon = CreatePen(PS_SOLID, std::max(1, s / 16), RGB(255, 80, 240));
     HPEN oldP = static_cast<HPEN>(SelectObject(mem, neon));
     HBRUSH noFill = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
     HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(mem, noFill));
-    RoundRect(mem, 0, 0, s, s, 6, 6);
+    RoundRect(mem, 0, 0, s, s, corner, corner);
     SelectObject(mem, oldP);
     SelectObject(mem, oldBr);
     DeleteObject(neon);
 
-    HFONT f = CreateFontA(10, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    const int fontH = std::max(8, (s * 10) / 16);
+    HFONT f = CreateFontA(fontH, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     HFONT oldF = static_cast<HFONT>(SelectObject(mem, f));
     SetBkMode(mem, TRANSPARENT);
@@ -141,6 +163,17 @@ static HICON CreateNeonTrayIcon() {
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
     return icon;
+}
+
+static void ShowAboutWidgetNexus(HWND owner) {
+    std::string text = "Widget Nexus — desktop widget launcher.\r\n\r\nVersion ";
+    text += kAppVersion;
+    text += "\r\n\r\nRepository:\r\n";
+    text += kAppRepoUrl;
+    text += "\r\n\r\nOpen the repository page in your browser now?";
+    if (MessageBoxA(owner, text.c_str(), "About Widget Nexus", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        ShellExecuteA(owner, "open", kAppRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 static void ThemeCreate() {
@@ -737,6 +770,130 @@ static void ApplyGroupFloaterTopmost(size_t i) {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
+static void LayoutFloatingWidgets();
+
+static FloaterAnim* FindFloaterAnim(HWND hwnd) {
+    for (auto& a : g_floaterAnims) {
+        if (a.hwnd == hwnd) return &a;
+    }
+    return nullptr;
+}
+
+static void RemoveFloaterAnim(HWND hwnd) {
+    g_floaterAnims.erase(
+        std::remove_if(g_floaterAnims.begin(), g_floaterAnims.end(), [hwnd](const FloaterAnim& a) { return a.hwnd == hwnd; }),
+        g_floaterAnims.end());
+}
+
+static void EnsureFloaterAnimTimer() {
+    if (!g_nexusHwnd || g_floaterAnims.empty()) return;
+    SetTimer(g_nexusHwnd, IDT_FLOATER_ANIM, kFloaterAnimIntervalMs, nullptr);
+}
+
+static void StopFloaterAnimTimerIfIdle() {
+    if (g_nexusHwnd && g_floaterAnims.empty()) KillTimer(g_nexusHwnd, IDT_FLOATER_ANIM);
+}
+
+static void PushFloaterFadeIn(HWND hwnd) {
+    if (!hwnd) return;
+    RemoveFloaterAnim(hwnd);
+    FloaterAnim a{};
+    a.hwnd = hwnd;
+    a.alpha = 0;
+    a.kind = FloaterAnimKind::FadeIn;
+    g_floaterAnims.push_back(a);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    EnsureFloaterAnimTimer();
+}
+
+static void PushFloaterFadeOut(HWND hwnd) {
+    if (!hwnd) return;
+    RemoveFloaterAnim(hwnd);
+    FloaterAnim a{};
+    a.hwnd = hwnd;
+    a.alpha = kFloaterAlpha;
+    a.kind = FloaterAnimKind::FadeOut;
+    g_floaterAnims.push_back(a);
+    SetLayeredWindowAttributes(hwnd, 0, a.alpha, LWA_ALPHA);
+    EnsureFloaterAnimTimer();
+}
+
+static void PushGroupFloaterPulse(HWND hwnd) {
+    if (!hwnd) return;
+    RemoveFloaterAnim(hwnd);
+    FloaterAnim a{};
+    a.hwnd = hwnd;
+    a.alpha = kFloaterAlpha;
+    a.kind = FloaterAnimKind::PulseDown;
+    g_floaterAnims.push_back(a);
+    EnsureFloaterAnimTimer();
+}
+
+static void TickFloaterAnimations() {
+    if (!g_nexusHwnd) return;
+    bool layoutNeeded = false;
+    const int step = static_cast<int>(kFloaterAnimStep);
+
+    for (size_t i = 0; i < g_floaterAnims.size();) {
+        FloaterAnim& a = g_floaterAnims[i];
+        if (!IsWindow(a.hwnd)) {
+            g_floaterAnims.erase(g_floaterAnims.begin() + i);
+            continue;
+        }
+
+        switch (a.kind) {
+        case FloaterAnimKind::FadeIn: {
+            const int next = std::min(static_cast<int>(kFloaterAlpha), static_cast<int>(a.alpha) + step);
+            a.alpha = static_cast<BYTE>(next);
+            SetLayeredWindowAttributes(a.hwnd, 0, a.alpha, LWA_ALPHA);
+            if (a.alpha >= kFloaterAlpha) {
+                g_floaterAnims.erase(g_floaterAnims.begin() + i);
+                continue;
+            }
+            break;
+        }
+        case FloaterAnimKind::FadeOut: {
+            const int next = std::max(0, static_cast<int>(a.alpha) - step);
+            a.alpha = static_cast<BYTE>(next);
+            SetLayeredWindowAttributes(a.hwnd, 0, a.alpha, LWA_ALPHA);
+            if (a.alpha <= 0) {
+                SetLayeredWindowAttributes(a.hwnd, 0, kFloaterAlpha, LWA_ALPHA);
+                ShowWindow(a.hwnd, SW_HIDE);
+                g_floaterAnims.erase(g_floaterAnims.begin() + i);
+                layoutNeeded = true;
+                continue;
+            }
+            break;
+        }
+        case FloaterAnimKind::PulseDown: {
+            if (static_cast<int>(a.alpha) - step <= static_cast<int>(kGroupPulseLowAlpha)) {
+                a.alpha = kGroupPulseLowAlpha;
+                a.kind = FloaterAnimKind::PulseUp;
+            } else {
+                a.alpha = static_cast<BYTE>(static_cast<int>(a.alpha) - step);
+            }
+            SetLayeredWindowAttributes(a.hwnd, 0, a.alpha, LWA_ALPHA);
+            break;
+        }
+        case FloaterAnimKind::PulseUp: {
+            const int next = std::min(static_cast<int>(kFloaterAlpha), static_cast<int>(a.alpha) + step);
+            a.alpha = static_cast<BYTE>(next);
+            SetLayeredWindowAttributes(a.hwnd, 0, a.alpha, LWA_ALPHA);
+            if (a.alpha >= kFloaterAlpha) {
+                g_floaterAnims.erase(g_floaterAnims.begin() + i);
+                continue;
+            }
+            break;
+        }
+        }
+        ++i;
+    }
+
+    StopFloaterAnimTimerIfIdle();
+    if (layoutNeeded) LayoutFloatingWidgets();
+}
+
 static bool IsWidgetVisible(const WidgetRow& row) {
     if (row.w.groupName.empty()) return row.w.alwaysVisible || g_showNonPinned;
     const int groupIndex = FindGroupIndexByName(row.w.groupName);
@@ -744,15 +901,67 @@ static bool IsWidgetVisible(const WidgetRow& row) {
     return row.w.alwaysVisible || g_showNonPinned;
 }
 
-static void SyncFloaterVisibility() {
+static bool WidgetOccupiesLayoutSlot(const WidgetRow& row) {
+    if (!row.floater) return false;
+    if (IsWidgetVisible(row)) return true;
+    const FloaterAnim* anim = FindFloaterAnim(row.floater);
+    return anim && anim->kind == FloaterAnimKind::FadeOut;
+}
+
+static void SyncFloaterVisibility(bool animate = true) {
+    if (!animate) {
+        g_floaterAnims.clear();
+        if (g_nexusHwnd) KillTimer(g_nexusHwnd, IDT_FLOATER_ANIM);
+        for (auto& r : g_rows) {
+            if (!r.floater) continue;
+            const bool show = IsWidgetVisible(r);
+            if (show) {
+                ShowWindow(r.floater, SW_SHOWNOACTIVATE);
+                SetLayeredWindowAttributes(r.floater, 0, kFloaterAlpha, LWA_ALPHA);
+            } else {
+                SetLayeredWindowAttributes(r.floater, 0, kFloaterAlpha, LWA_ALPHA);
+                ShowWindow(r.floater, SW_HIDE);
+            }
+        }
+        for (auto& g : g_groups) {
+            if (!g.floater) continue;
+            ShowWindow(g.floater, SW_SHOWNOACTIVATE);
+            SetLayeredWindowAttributes(g.floater, 0, kFloaterAlpha, LWA_ALPHA);
+        }
+        return;
+    }
+
     for (auto& r : g_rows) {
         if (!r.floater) continue;
-        const bool show = IsWidgetVisible(r);
-        ShowWindow(r.floater, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+        const bool want = IsWidgetVisible(r);
+        const bool shown = IsWindowVisible(r.floater) != FALSE;
+
+        if (want) {
+            FloaterAnim* anim = FindFloaterAnim(r.floater);
+            if (anim && anim->kind == FloaterAnimKind::FadeOut) {
+                RemoveFloaterAnim(r.floater);
+                PushFloaterFadeIn(r.floater);
+            } else if (!shown) {
+                PushFloaterFadeIn(r.floater);
+            } else if (!anim) {
+                SetLayeredWindowAttributes(r.floater, 0, kFloaterAlpha, LWA_ALPHA);
+            }
+        } else {
+            FloaterAnim* anim = FindFloaterAnim(r.floater);
+            if (anim && anim->kind == FloaterAnimKind::FadeIn) {
+                RemoveFloaterAnim(r.floater);
+                PushFloaterFadeOut(r.floater);
+            } else if (shown && (!anim || anim->kind != FloaterAnimKind::FadeOut)) {
+                PushFloaterFadeOut(r.floater);
+            }
+        }
     }
     for (auto& g : g_groups) {
         if (!g.floater) continue;
         ShowWindow(g.floater, SW_SHOWNOACTIVATE);
+        if (!FindFloaterAnim(g.floater)) {
+            SetLayeredWindowAttributes(g.floater, 0, kFloaterAlpha, LWA_ALPHA);
+        }
     }
 }
 
@@ -808,7 +1017,7 @@ static void LayoutFloatingWidgets() {
         placeFloater(g_groups[gi].floater, kGroupFloaterDiameter);
         for (size_t wi = 0; wi < g_rows.size(); ++wi) {
             if (g_rows[wi].w.groupName != g_groups[gi].g.name) continue;
-            if (!IsWidgetVisible(g_rows[wi])) continue;
+            if (!WidgetOccupiesLayoutSlot(g_rows[wi])) continue;
             placeFloater(g_rows[wi].floater, kFloaterDiameter);
         }
     }
@@ -816,7 +1025,7 @@ static void LayoutFloatingWidgets() {
     for (size_t wi = 0; wi < g_rows.size(); ++wi) {
         const int groupIndex = FindGroupIndexByName(g_rows[wi].w.groupName);
         if (groupIndex >= 0) continue;
-        if (!IsWidgetVisible(g_rows[wi])) continue;
+        if (!WidgetOccupiesLayoutSlot(g_rows[wi])) continue;
         placeFloater(g_rows[wi].floater, kFloaterDiameter);
     }
 }
@@ -891,6 +1100,8 @@ static void CreateGroupFloaterForIndex(HINSTANCE inst, size_t i) {
 }
 
 static void DestroyAllFloaters() {
+    g_floaterAnims.clear();
+    if (g_nexusHwnd) KillTimer(g_nexusHwnd, IDT_FLOATER_ANIM);
     for (auto& r : g_rows) {
         if (r.floater) {
             DestroyWindow(r.floater);
@@ -911,7 +1122,7 @@ static void RebuildAllFloaters(HINSTANCE inst) {
     for (size_t i = 0; i < g_groups.size(); ++i) CreateGroupFloaterForIndex(inst, i);
     LayoutFloatingWidgets();
     LayoutGroupFloaters();
-    SyncFloaterVisibility();
+    SyncFloaterVisibility(false);
     for (size_t i = 0; i < g_rows.size(); ++i) ApplyFloaterTopmost(i);
     for (size_t i = 0; i < g_groups.size(); ++i) ApplyGroupFloaterTopmost(i);
 }
@@ -924,7 +1135,7 @@ static void TrayAdd(HWND hWnd) {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    if (!g_trayIcon) g_trayIcon = CreateNeonTrayIcon();
+    if (!g_trayIcon) g_trayIcon = CreateNeonWlIcon(16);
     nid.hIcon = g_trayIcon ? g_trayIcon : LoadIconA(nullptr, IDI_APPLICATION);
     lstrcpyA(nid.szTip, "Widget Nexus — right-click for menu");
     Shell_NotifyIconA(NIM_ADD, &nid);
@@ -1089,6 +1300,7 @@ static LRESULT CALLBACK GroupFloaterWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
         if (idx >= 0 && idx < static_cast<int>(g_groups.size())) {
             g_groups[idx].g.visible = !g_groups[idx].g.visible;
             RefreshGroupFloaterChrome(static_cast<size_t>(idx));
+            if (g_groups[idx].floater) PushGroupFloaterPulse(g_groups[idx].floater);
             SyncFloaterVisibility();
             LayoutFloatingWidgets();
             if (g_nexusHwnd) {
@@ -1128,15 +1340,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             POINT pt{};
             GetCursorPos(&pt);
             HMENU m = CreatePopupMenu();
-            AppendMenuA(m, MF_STRING, 1, "Show Nexus");
-            AppendMenuA(m, MF_STRING, 2, "Exit");
+            constexpr UINT kTrayCmdShow = 1;
+            constexpr UINT kTrayCmdExit = 2;
+            constexpr UINT kTrayCmdAbout = 3;
+            AppendMenuA(m, MF_STRING, kTrayCmdShow, "Show Nexus");
+            AppendMenuA(m, MF_STRING, kTrayCmdAbout, "About Widget Nexus…");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, kTrayCmdExit, "Exit");
             SetForegroundWindow(hWnd);
             const UINT cmd = TrackPopupMenu(m, TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, nullptr);
             DestroyMenu(m);
-            if (cmd == 1) {
+            if (cmd == kTrayCmdShow) {
                 ShowWindow(hWnd, SW_SHOW);
                 SetForegroundWindow(hWnd);
-            } else if (cmd == 2) {
+            } else if (cmd == kTrayCmdAbout) {
+                ShowAboutWidgetNexus(hWnd);
+            } else if (cmd == kTrayCmdExit) {
                 DestroyWindow(hWnd);
             }
             return 0;
@@ -1512,6 +1731,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+    case WM_TIMER:
+        if (wParam == IDT_FLOATER_ANIM) {
+            TickFloaterAnimations();
+            return 0;
+        }
+        break;
+
     case WM_DESTROY:
         TrayRemove();
         DestroyAllFloaters();
@@ -1519,6 +1745,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_trayIcon) {
             DestroyIcon(g_trayIcon);
             g_trayIcon = nullptr;
+        }
+        if (g_windowIcon) {
+            DestroyIcon(g_windowIcon);
+            g_windowIcon = nullptr;
+        }
+        if (g_windowIconSm) {
+            DestroyIcon(g_windowIconSm);
+            g_windowIconSm = nullptr;
         }
         g_nexusHwnd = nullptr;
         PostQuitMessage(0);
@@ -1532,12 +1766,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     const char CLASS_NAME[] = "WidgetLauncherWin32";
 
+    g_windowIcon = CreateNeonWlIcon(32);
+    g_windowIconSm = CreateNeonWlIcon(16);
+
     WNDCLASSA wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
+    // Icons are applied with WM_SETICON so we retain ownership and can DestroyIcon in WM_DESTROY.
 
     RegisterClassA(&wc);
 
@@ -1564,8 +1802,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         nullptr, nullptr, hInstance, nullptr
     );
 
-    if (!hWnd) return 0;
+    if (!hWnd) {
+        if (g_windowIcon) {
+            DestroyIcon(g_windowIcon);
+            g_windowIcon = nullptr;
+        }
+        if (g_windowIconSm) {
+            DestroyIcon(g_windowIconSm);
+            g_windowIconSm = nullptr;
+        }
+        return 0;
+    }
     g_nexusHwnd = hWnd;
+    if (g_windowIcon) SendMessageA(hWnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_windowIcon));
+    if (g_windowIconSm) SendMessageA(hWnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_windowIconSm));
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
 
