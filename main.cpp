@@ -3,6 +3,8 @@
 #include <shellapi.h>
 #include <uxtheme.h>
 
+#include "motion_tokens.h"
+
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -39,6 +41,16 @@ static bool g_showNonPinned = true;
 static int g_selectedModelIndex = -1;
 static int g_selectedGroupIndex = -1;
 static std::string g_configPath = "widgets.txt";
+
+static void InitConfigPathBesideExe() {
+    char exe[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::string path(exe, exe + static_cast<size_t>(n));
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return;
+    g_configPath = path.substr(0, slash + 1) + "widgets.txt";
+}
 static HINSTANCE g_hInstance = nullptr;
 static HWND g_nexusHwnd = nullptr;
 static bool g_trayIconAdded = false;
@@ -62,9 +74,14 @@ static constexpr int kFloaterMargin = 10;
 static constexpr BYTE kFloaterAlpha = 200; // layered window opacity (0 = invisible, 255 = opaque)
 
 static constexpr UINT_PTR IDT_FLOATER_ANIM = WM_USER + 150;
-static constexpr UINT kFloaterAnimIntervalMs = 22;
-static constexpr BYTE kFloaterAnimStep = 32;
-static constexpr BYTE kGroupPulseLowAlpha = 118;
+static constexpr UINT_PTR IDT_UI_ANIM = WM_USER + 151;
+static constexpr UINT kFloaterAnimIntervalMs = 20;
+static constexpr BYTE kFloaterAnimStep = motion::AlphaStep(
+    0,
+    kFloaterAlpha,
+    motion::DurationToTicks(motion::Tokens::kPanelMs, kFloaterAnimIntervalMs));
+static constexpr BYTE kGroupPulseLowAlpha = static_cast<BYTE>((static_cast<unsigned int>(kFloaterAlpha) * 62u) / 100u);
+static constexpr UINT kUiAnimIntervalMs = 15;
 
 enum class FloaterAnimKind : unsigned char { FadeIn, FadeOut, PulseDown, PulseUp };
 
@@ -75,6 +92,22 @@ struct FloaterAnim {
 };
 
 static std::vector<FloaterAnim> g_floaterAnims;
+
+struct ButtonPressAnim {
+    HWND hwnd = nullptr;
+    unsigned int ticksLeft = 0;
+    unsigned int ticksTotal = 0;
+};
+
+struct ListSelectAnim {
+    HWND listHwnd = nullptr;
+    int selectedItemData = -1;
+    unsigned int ticksLeft = 0;
+    unsigned int ticksTotal = 0;
+};
+
+static std::vector<ButtonPressAnim> g_buttonPressAnims;
+static ListSelectAnim g_widgetSelectAnim;
 
 enum ControlIds {
     IDC_SHOW_NON_PINNED = 101,
@@ -96,15 +129,27 @@ enum ControlIds {
     IDC_CHECK_GROUP_ALWAYS = 117
 };
 
-// Neon palette (dark cyber / synthwave)
-static constexpr COLORREF kRgbDeep0 = RGB(6, 8, 18);
-static constexpr COLORREF kRgbPanel = RGB(14, 18, 40);
-static constexpr COLORREF kRgbEdit = RGB(10, 14, 32);
-static constexpr COLORREF kRgbNeonCyan = RGB(0, 245, 255);
-static constexpr COLORREF kRgbNeonMagenta = RGB(255, 0, 200);
-static constexpr COLORREF kRgbNeonDim = RGB(0, 140, 180);
-static constexpr COLORREF kRgbTextHi = RGB(220, 255, 255);
-static constexpr COLORREF kRgbTextLo = RGB(140, 180, 200);
+// Style spec v2 — see STYLE_SPEC_V2.md (surfaces, accents, text)
+static constexpr COLORREF kRgbDeep0 = RGB(8, 10, 20);          // bg.canvas
+static constexpr COLORREF kRgbPanel = RGB(16, 20, 42);        // bg.panel
+static constexpr COLORREF kRgbEdit = RGB(12, 16, 34);         // bg.control
+static constexpr COLORREF kRgbControlHover = RGB(18, 24, 48); // bg.controlHover
+static constexpr COLORREF kRgbControlActive = RGB(24, 34, 66); // bg.controlActive
+static constexpr COLORREF kRgbNeonCyan = RGB(0, 220, 235);    // accent.primary
+static constexpr COLORREF kRgbNeonMagenta = RGB(235, 72, 198);  // accent.secondary
+static constexpr COLORREF kRgbNeonDim = RGB(0, 128, 158);     // accent.primaryDim
+static constexpr COLORREF kRgbTextHi = RGB(224, 246, 255);    // text.primary
+static constexpr COLORREF kRgbTextLo = RGB(154, 188, 208);    // text.secondary
+static constexpr COLORREF kRgbGroupOnFill = RGB(18, 48, 30);  // darkened state.success
+static constexpr COLORREF kRgbGroupOffFill = RGB(48, 22, 26); // darkened state.error
+
+// Luxury neon layer — depth, gradients (GradientFill / msimg32)
+static constexpr COLORREF kRgbLuxCanvasTop = RGB(18, 22, 46);
+static constexpr COLORREF kRgbLuxCanvasBot = RGB(6, 8, 17);
+static constexpr COLORREF kRgbLuxPanelTop = RGB(28, 34, 62);
+static constexpr COLORREF kRgbLuxShadow = RGB(3, 4, 12);
+static constexpr COLORREF kRgbLuxVignetteEdge = RGB(4, 5, 14);
+static constexpr COLORREF kRgbBgStatus = RGB(10, 14, 30);
 
 static HBRUSH g_brDeep = nullptr;
 static HBRUSH g_brPanel = nullptr;
@@ -117,7 +162,100 @@ static HPEN g_penGlow = nullptr;
 static HFONT g_fontTitle = nullptr;
 static HFONT g_fontUi = nullptr;
 static HFONT g_fontMono = nullptr;
+static HFONT g_fontSection = nullptr;
+static HBRUSH g_brStatus = nullptr;
 static int g_listItemHeight = 40;
+
+static COLORREF LuxBlendRgb(COLORREF a, COLORREF b, float t) {
+    t = std::max(0.0f, std::min(1.0f, t));
+    const BYTE r = static_cast<BYTE>(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t);
+    const BYTE gg = static_cast<BYTE>(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t);
+    const BYTE bb = static_cast<BYTE>(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t);
+    return RGB(r, gg, bb);
+}
+
+static void LuxGradientVertical(HDC hdc, const RECT& rc, COLORREF top, COLORREF bottom) {
+    TRIVERTEX tv[2]{};
+    GRADIENT_RECT gr{};
+    tv[0].x = rc.left;
+    tv[0].y = rc.top;
+    tv[0].Red = static_cast<COLOR16>(static_cast<USHORT>(GetRValue(top)) << 8);
+    tv[0].Green = static_cast<COLOR16>(static_cast<USHORT>(GetGValue(top)) << 8);
+    tv[0].Blue = static_cast<COLOR16>(static_cast<USHORT>(GetBValue(top)) << 8);
+    tv[0].Alpha = 0xff00;
+    tv[1].x = rc.right;
+    tv[1].y = rc.bottom;
+    tv[1].Red = static_cast<COLOR16>(static_cast<USHORT>(GetRValue(bottom)) << 8);
+    tv[1].Green = static_cast<COLOR16>(static_cast<USHORT>(GetGValue(bottom)) << 8);
+    tv[1].Blue = static_cast<COLOR16>(static_cast<USHORT>(GetBValue(bottom)) << 8);
+    tv[1].Alpha = 0xff00;
+    gr.UpperLeft = 0;
+    gr.LowerRight = 1;
+    GradientFill(hdc, tv, 2, &gr, 1, GRADIENT_FILL_RECT_V);
+}
+
+static void LuxGradientHorizontal(HDC hdc, const RECT& rc, COLORREF left, COLORREF rightC) {
+    TRIVERTEX tv[2]{};
+    GRADIENT_RECT gr{};
+    tv[0].x = rc.left;
+    tv[0].y = rc.top;
+    tv[0].Red = static_cast<COLOR16>(static_cast<USHORT>(GetRValue(left)) << 8);
+    tv[0].Green = static_cast<COLOR16>(static_cast<USHORT>(GetGValue(left)) << 8);
+    tv[0].Blue = static_cast<COLOR16>(static_cast<USHORT>(GetBValue(left)) << 8);
+    tv[0].Alpha = 0xff00;
+    tv[1].x = rc.right;
+    tv[1].y = rc.bottom;
+    tv[1].Red = static_cast<COLOR16>(static_cast<USHORT>(GetRValue(rightC)) << 8);
+    tv[1].Green = static_cast<COLOR16>(static_cast<USHORT>(GetGValue(rightC)) << 8);
+    tv[1].Blue = static_cast<COLOR16>(static_cast<USHORT>(GetBValue(rightC)) << 8);
+    tv[1].Alpha = 0xff00;
+    gr.UpperLeft = 0;
+    gr.LowerRight = 1;
+    GradientFill(hdc, tv, 2, &gr, 1, GRADIENT_FILL_RECT_H);
+}
+
+static void PaintLuxuryPanelCard(HDC hdc, const RECT& panelRc) {
+    RECT shadow = panelRc;
+    OffsetRect(&shadow, 5, 5);
+    HBRUSH sh = CreateSolidBrush(kRgbLuxShadow);
+    FillRect(hdc, &shadow, sh);
+    DeleteObject(sh);
+
+    LuxGradientVertical(hdc, panelRc, kRgbLuxPanelTop, kRgbPanel);
+
+    HPEN edge = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbDeep0, 0.25f));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, edge));
+    HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+    Rectangle(hdc, panelRc.left, panelRc.top, panelRc.right, panelRc.bottom);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(edge);
+
+    HPEN hi = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbNeonCyan, 0.4f));
+    oldPen = static_cast<HPEN>(SelectObject(hdc, hi));
+    MoveToEx(hdc, panelRc.left + 1, panelRc.top + 1, nullptr);
+    LineTo(hdc, panelRc.right - 2, panelRc.top + 1);
+    SelectObject(hdc, oldPen);
+    DeleteObject(hi);
+}
+
+static void DrawLuxurySectionCaption(HDC hdc, const RECT& panelRc, const char* text, int baselineY) {
+    if (!g_fontSection || !text) return;
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, LuxBlendRgb(kRgbTextLo, kRgbNeonCyan, 0.35f));
+    HFONT oldF = static_cast<HFONT>(SelectObject(hdc, g_fontSection));
+    RECT tr{ panelRc.left + 14, baselineY, panelRc.right - 12, baselineY + 18 };
+    DrawTextA(hdc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_BOTTOM | DT_NOPREFIX);
+
+    HPEN capLine = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbNeonMagenta, 0.45f));
+    HPEN oldP = static_cast<HPEN>(SelectObject(hdc, capLine));
+    MoveToEx(hdc, tr.left, tr.bottom + 2, nullptr);
+    LineTo(hdc, tr.left + 72, tr.bottom + 2);
+    SelectObject(hdc, oldP);
+    DeleteObject(capLine);
+
+    SelectObject(hdc, oldF);
+}
 
 static HICON CreateNeonWlIcon(int pixelSize) {
     const int s = std::max(8, pixelSize);
@@ -181,23 +319,28 @@ static void ThemeCreate() {
     g_brDeep = CreateSolidBrush(kRgbDeep0);
     g_brPanel = CreateSolidBrush(kRgbPanel);
     g_brEdit = CreateSolidBrush(kRgbEdit);
-    g_brListSel = CreateSolidBrush(RGB(24, 36, 72));
-    g_brBtn = CreateSolidBrush(RGB(18, 26, 52));
-    g_brBtnHot = CreateSolidBrush(RGB(28, 40, 78));
-    g_penFrame = CreatePen(PS_SOLID, 2, kRgbNeonCyan);
+    g_brListSel = CreateSolidBrush(kRgbControlActive);
+    g_brBtn = CreateSolidBrush(kRgbEdit);
+    g_brBtnHot = CreateSolidBrush(kRgbControlHover);
+    g_penFrame = CreatePen(PS_SOLID, 1, kRgbNeonCyan);
     g_penGlow = CreatePen(PS_SOLID, 1, kRgbNeonDim);
-    g_fontTitle = CreateFontA(26, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    g_fontTitle = CreateFontA(24, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-    g_fontUi = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    g_fontUi = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-    g_fontMono = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    g_fontMono = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    g_fontSection = CreateFontA(12, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_brStatus = CreateSolidBrush(kRgbBgStatus);
 }
 
 static void ThemeDestroy() {
     if (g_fontTitle) { DeleteObject(g_fontTitle); g_fontTitle = nullptr; }
     if (g_fontUi) { DeleteObject(g_fontUi); g_fontUi = nullptr; }
     if (g_fontMono) { DeleteObject(g_fontMono); g_fontMono = nullptr; }
+    if (g_fontSection) { DeleteObject(g_fontSection); g_fontSection = nullptr; }
+    if (g_brStatus) { DeleteObject(g_brStatus); g_brStatus = nullptr; }
     if (g_penFrame) { DeleteObject(g_penFrame); g_penFrame = nullptr; }
     if (g_penGlow) { DeleteObject(g_penGlow); g_penGlow = nullptr; }
     if (g_brDeep) { DeleteObject(g_brDeep); g_brDeep = nullptr; }
@@ -217,7 +360,17 @@ static void ApplyNeonControlSkin(HWND hCtrl) {
 static void PaintNeonWindow(HWND hWnd, HDC hdc) {
     RECT rc{};
     GetClientRect(hWnd, &rc);
-    FillRect(hdc, &rc, g_brDeep);
+    LuxGradientVertical(hdc, rc, kRgbLuxCanvasTop, kRgbLuxCanvasBot);
+
+    // Edge vignette (horizontal bands — cheap depth)
+    const int canvasW = static_cast<int>(rc.right - rc.left);
+    const int vignetteW = std::min(72, canvasW / 6);
+    if (vignetteW > 8) {
+        RECT vl{ rc.left, rc.top, rc.left + vignetteW, rc.bottom };
+        LuxGradientHorizontal(hdc, vl, kRgbLuxVignetteEdge, LuxBlendRgb(kRgbLuxCanvasTop, kRgbLuxCanvasBot, 0.5f));
+        RECT vr{ rc.right - vignetteW, rc.top, rc.right, rc.bottom };
+        LuxGradientHorizontal(hdc, vr, LuxBlendRgb(kRgbLuxCanvasTop, kRgbLuxCanvasBot, 0.5f), kRgbLuxVignetteEdge);
+    }
 
     // Scanline-style tint in header only (keeps repaint cheap)
     const int savedDc = SaveDC(hdc);
@@ -225,7 +378,7 @@ static void PaintNeonWindow(HWND hWnd, HDC hdc) {
     const int clipH = 58;
     for (int y = 0; y < clipH; y += 3) {
         const int t = (y * 255) / std::max(1, clipH);
-        const COLORREF c = RGB(6 + t / 18, 8 + t / 22, 22 + t / 6);
+        const COLORREF c = RGB(14 + t / 24, 18 + t / 28, 36 + t / 10);
         RECT strip{ rc.left, y, rc.right, y + 3 };
         HBRUSH b = CreateSolidBrush(c);
         FillRect(hdc, &strip, b);
@@ -233,31 +386,52 @@ static void PaintNeonWindow(HWND hWnd, HDC hdc) {
     }
     if (savedDc) RestoreDC(hdc, savedDc);
 
-    // Panel wells (behind controls)
+    // Luxury panel cards (drop shadow + vertical gradient + rim highlight)
     RECT leftPanel{ 8, 74, 360, rc.bottom - 44 };
     RECT rightPanel{ 364, 74, rc.right - 8, rc.bottom - 44 };
-    FillRect(hdc, &leftPanel, g_brPanel);
-    FillRect(hdc, &rightPanel, g_brPanel);
-    HPEN wellPen = CreatePen(PS_SOLID, 1, kRgbNeonDim);
-    HPEN oldPen2 = static_cast<HPEN>(SelectObject(hdc, wellPen));
-    HBRUSH oldBr2 = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
-    Rectangle(hdc, leftPanel.left, leftPanel.top, leftPanel.right, leftPanel.bottom);
-    Rectangle(hdc, rightPanel.left, rightPanel.top, rightPanel.right, rightPanel.bottom);
-    SelectObject(hdc, oldPen2);
-    SelectObject(hdc, oldBr2);
-    DeleteObject(wellPen);
+    PaintLuxuryPanelCard(hdc, leftPanel);
+    PaintLuxuryPanelCard(hdc, rightPanel);
 
-    // Outer neon frame (double line glow)
-    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, g_penGlow));
-    HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
-    Rectangle(hdc, rc.left + 6, rc.top + 6, rc.right - 6, rc.bottom - 6);
-    SelectObject(hdc, g_penFrame);
+    constexpr int kGroupsColumnX = 372 + 438; // matches WM_CREATE layout
+    DrawLuxurySectionCaption(hdc, leftPanel, "WIDGETS", leftPanel.top + 6);
+    const int detailsRight = std::min(kGroupsColumnX - 6, static_cast<int>(rightPanel.right));
+    RECT detailsBand{ rightPanel.left, rightPanel.top, detailsRight, rightPanel.bottom };
+    DrawLuxurySectionCaption(hdc, detailsBand, "DETAILS", rightPanel.top + 6);
+    const int groupsLo = rightPanel.left + 12;
+    const int groupsHi = std::max(groupsLo + 44, static_cast<int>(rightPanel.right) - 40);
+    const int groupsLeft = std::clamp(kGroupsColumnX - 8, groupsLo, groupsHi);
+    RECT groupsBand{ groupsLeft, rightPanel.top, rightPanel.right, rightPanel.bottom };
+    if (groupsBand.left < groupsBand.right - 40) {
+        DrawLuxurySectionCaption(hdc, groupsBand, "GROUPS", rightPanel.top + 6);
+    }
+
+    // Bottom status strip (visual anchor; status control uses g_brStatus via WM_CTLCOLORSTATIC)
+    RECT statusStrip{ rc.left + 8, rc.bottom - 40, rc.right - 8, rc.bottom - 8 };
+    FillRect(hdc, &statusStrip, g_brStatus ? g_brStatus : g_brDeep);
+    HPEN statusHi = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbDeep0, 0.5f));
+    HPEN oldStat = static_cast<HPEN>(SelectObject(hdc, statusHi));
+    MoveToEx(hdc, statusStrip.left, statusStrip.top, nullptr);
+    LineTo(hdc, statusStrip.right, statusStrip.top);
+    SelectObject(hdc, oldStat);
+    DeleteObject(statusHi);
+
+    // Soft outer frame (1px dim) + inner accent along header only (v2)
+    HPEN outerPen = CreatePen(PS_SOLID, 1, kRgbNeonDim);
+    HPEN penRestore = static_cast<HPEN>(SelectObject(hdc, outerPen));
+    HBRUSH oldBrFrame = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
     Rectangle(hdc, rc.left + 8, rc.top + 8, rc.right - 8, rc.bottom - 8);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBr);
+    HPEN innerGlow = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonCyan, kRgbDeep0, 0.55f));
+    HPEN penOuterHeld = static_cast<HPEN>(SelectObject(hdc, innerGlow));
+    MoveToEx(hdc, 18, rc.top + 9, nullptr);
+    LineTo(hdc, rc.right - 18, rc.top + 9);
+    SelectObject(hdc, penOuterHeld);
+    DeleteObject(innerGlow);
+    SelectObject(hdc, penRestore);
+    SelectObject(hdc, oldBrFrame);
+    DeleteObject(outerPen);
 
-    // Accent line under title zone
-    HPEN mag = CreatePen(PS_SOLID, 2, kRgbNeonMagenta);
+    // Accent line under title zone (lighter secondary stroke)
+    HPEN mag = CreatePen(PS_SOLID, 1, kRgbNeonMagenta);
     HPEN prevForMag = static_cast<HPEN>(SelectObject(hdc, mag));
     MoveToEx(hdc, 18, 52, nullptr);
     LineTo(hdc, rc.right - 18, 52);
@@ -267,7 +441,7 @@ static void PaintNeonWindow(HWND hWnd, HDC hdc) {
     SetBkMode(hdc, TRANSPARENT);
     HFONT oldF = static_cast<HFONT>(SelectObject(hdc, g_fontTitle));
     RECT titleRc{ 18, 10, rc.right - 18, 52 };
-    SetTextColor(hdc, RGB(0, 60, 70));
+    SetTextColor(hdc, RGB(0, 72, 88));
     RECT shadow = titleRc;
     OffsetRect(&shadow, 2, 2);
     DrawTextA(hdc, "WIDGET NEXUS", -1, &shadow, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -277,26 +451,61 @@ static void PaintNeonWindow(HWND hWnd, HDC hdc) {
 }
 
 static void DrawOwnerDrawButton(const DRAWITEMSTRUCT& dis) {
+    auto buttonAnimProgress = [](HWND hwnd) -> float {
+        for (const auto& a : g_buttonPressAnims) {
+            if (a.hwnd == hwnd && a.ticksTotal > 0 && a.ticksLeft > 0) {
+                return static_cast<float>(a.ticksTotal - a.ticksLeft) / static_cast<float>(a.ticksTotal);
+            }
+        }
+        return -1.0f;
+    };
+
+    auto blendColor = [](COLORREF from, COLORREF to, float t) -> COLORREF {
+        t = std::max(0.0f, std::min(1.0f, t));
+        const BYTE r = static_cast<BYTE>(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * t);
+        const BYTE g = static_cast<BYTE>(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * t);
+        const BYTE b = static_cast<BYTE>(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * t);
+        return RGB(r, g, b);
+    };
+
     const bool pressed = (dis.itemState & ODS_SELECTED) != 0;
     const bool focus = (dis.itemState & ODS_FOCUS) != 0;
     HDC hdc = dis.hDC;
     RECT rc = dis.rcItem;
 
-    HBRUSH fill = pressed ? g_brBtnHot : g_brBtn;
-    FillRect(hdc, &rc, fill);
+    const float pressAnim = buttonAnimProgress(dis.hwndItem);
+    const bool animatingPress = pressAnim >= 0.0f;
+    const COLORREF idleFill = kRgbEdit;
+    const COLORREF hotFill = kRgbControlHover;
+    COLORREF dynamicFill = pressed ? hotFill : idleFill;
+    if (!pressed && animatingPress) {
+        // Fast "press and release" flash mapped to Minimal Pro fast timing.
+        const float tri = (pressAnim < 0.5f) ? (pressAnim * 2.0f) : ((1.0f - pressAnim) * 2.0f);
+        dynamicFill = blendColor(idleFill, hotFill, tri * 0.6f);
+    }
+    const COLORREF fillTop = LuxBlendRgb(dynamicFill, kRgbNeonCyan, pressed ? 0.05f : 0.12f);
+    LuxGradientVertical(hdc, rc, fillTop, dynamicFill);
 
-    HPEN penOuter = CreatePen(PS_SOLID, 2, kRgbNeonCyan);
-    HPEN penInner = CreatePen(PS_SOLID, 1, kRgbNeonMagenta);
-    HPEN old = static_cast<HPEN>(SelectObject(hdc, penOuter));
+    HPEN penOuter = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbDeep0, 0.3f));
+    HPEN penInner = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbNeonCyan, 0.55f));
+    HPEN oldPenDc = static_cast<HPEN>(SelectObject(hdc, penOuter));
     HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    InflateRect(&rc, -2, -2);
-    SelectObject(hdc, penInner);
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(hdc, old);
+    Rectangle(hdc, dis.rcItem.left, dis.rcItem.top, dis.rcItem.right, dis.rcItem.bottom);
+    RECT innerRc = dis.rcItem;
+    InflateRect(&innerRc, -2, -2);
+    HPEN swapOuter = static_cast<HPEN>(SelectObject(hdc, penInner));
+    Rectangle(hdc, innerRc.left, innerRc.top, innerRc.right, innerRc.bottom);
+    HPEN hiTop = CreatePen(PS_SOLID, 1, LuxBlendRgb(dynamicFill, RGB(255, 255, 255), 0.18f));
+    HPEN swapInner = static_cast<HPEN>(SelectObject(hdc, hiTop));
+    MoveToEx(hdc, innerRc.left + 1, innerRc.top + 1, nullptr);
+    LineTo(hdc, innerRc.right - 2, innerRc.top + 1);
+    SelectObject(hdc, swapInner);
+    DeleteObject(hiTop);
+    SelectObject(hdc, swapOuter);
+    DeleteObject(penInner);
+    SelectObject(hdc, oldPenDc);
     SelectObject(hdc, oldBr);
     DeleteObject(penOuter);
-    DeleteObject(penInner);
     SelectObject(hdc, GetStockObject(BLACK_PEN));
 
     char caption[64]{};
@@ -316,13 +525,46 @@ static void DrawOwnerDrawButton(const DRAWITEMSTRUCT& dis) {
 }
 
 static void DrawOwnerDrawListItem(const DRAWITEMSTRUCT& dis) {
+    auto blendColor = [](COLORREF from, COLORREF to, float t) -> COLORREF {
+        t = std::max(0.0f, std::min(1.0f, t));
+        const BYTE r = static_cast<BYTE>(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * t);
+        const BYTE g = static_cast<BYTE>(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * t);
+        const BYTE b = static_cast<BYTE>(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * t);
+        return RGB(r, g, b);
+    };
+
     HDC hdc = dis.hDC;
     RECT rc = dis.rcItem;
     const bool selected = (dis.itemState & ODS_SELECTED) != 0;
 
-    FillRect(hdc, &rc, selected ? g_brListSel : g_brPanel);
+    COLORREF bgColor = selected ? kRgbControlActive : kRgbPanel;
+    const bool hasSelectAnim = (g_widgetSelectAnim.listHwnd == dis.hwndItem &&
+        g_widgetSelectAnim.selectedItemData == static_cast<int>(dis.itemData) &&
+        g_widgetSelectAnim.ticksLeft > 0 &&
+        g_widgetSelectAnim.ticksTotal > 0);
+    if (hasSelectAnim) {
+        const float progress = static_cast<float>(g_widgetSelectAnim.ticksTotal - g_widgetSelectAnim.ticksLeft) /
+            static_cast<float>(g_widgetSelectAnim.ticksTotal);
+        const float t = std::max(0.0f, std::min(1.0f, progress));
+        bgColor = blendColor(RGB(18, 22, 46), kRgbControlActive, t);
+    }
+    const COLORREF rowTop = LuxBlendRgb(bgColor, kRgbLuxPanelTop, selected ? 0.35f : 0.12f);
+    LuxGradientVertical(hdc, rc, rowTop, bgColor);
 
-    HPEN pen = CreatePen(PS_SOLID, selected ? 2 : 1, selected ? kRgbNeonCyan : kRgbNeonDim);
+    if (selected) {
+        RECT accent{ rc.left + 3, rc.top + 4, rc.left + 7, rc.bottom - 4 };
+        HBRUSH ab = CreateSolidBrush(LuxBlendRgb(kRgbNeonCyan, kRgbNeonMagenta, 0.15f));
+        FillRect(hdc, &accent, ab);
+        DeleteObject(ab);
+        HPEN hiRow = CreatePen(PS_SOLID, 1, LuxBlendRgb(bgColor, RGB(255, 255, 255), 0.12f));
+        HPEN op = static_cast<HPEN>(SelectObject(hdc, hiRow));
+        MoveToEx(hdc, rc.left + 8, rc.top + 3, nullptr);
+        LineTo(hdc, rc.right - 4, rc.top + 3);
+        SelectObject(hdc, op);
+        DeleteObject(hiRow);
+    }
+
+    HPEN pen = CreatePen(PS_SOLID, 1, selected ? LuxBlendRgb(kRgbNeonCyan, kRgbDeep0, 0.15f) : LuxBlendRgb(kRgbNeonDim, kRgbDeep0, 0.35f));
     HPEN oldP = static_cast<HPEN>(SelectObject(hdc, pen));
     HBRUSH oldB = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
     Rectangle(hdc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
@@ -894,6 +1136,76 @@ static void TickFloaterAnimations() {
     if (layoutNeeded) LayoutFloatingWidgets();
 }
 
+static void EnsureUiAnimTimer() {
+    if (!g_nexusHwnd) return;
+    const bool haveButtonAnim = !g_buttonPressAnims.empty();
+    const bool haveListAnim = (g_widgetSelectAnim.ticksLeft > 0);
+    if (haveButtonAnim || haveListAnim) {
+        SetTimer(g_nexusHwnd, IDT_UI_ANIM, kUiAnimIntervalMs, nullptr);
+    }
+}
+
+static void StopUiAnimTimerIfIdle() {
+    if (!g_nexusHwnd) return;
+    const bool haveButtonAnim = !g_buttonPressAnims.empty();
+    const bool haveListAnim = (g_widgetSelectAnim.ticksLeft > 0);
+    if (!haveButtonAnim && !haveListAnim) {
+        KillTimer(g_nexusHwnd, IDT_UI_ANIM);
+    }
+}
+
+static void StartButtonPressAnim(HWND hwnd) {
+    if (!hwnd) return;
+    g_buttonPressAnims.erase(
+        std::remove_if(g_buttonPressAnims.begin(), g_buttonPressAnims.end(), [hwnd](const ButtonPressAnim& a) { return a.hwnd == hwnd; }),
+        g_buttonPressAnims.end());
+
+    ButtonPressAnim a{};
+    a.hwnd = hwnd;
+    a.ticksTotal = motion::DurationToTicks(motion::Tokens::kFastMs, kUiAnimIntervalMs);
+    a.ticksLeft = a.ticksTotal;
+    g_buttonPressAnims.push_back(a);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    EnsureUiAnimTimer();
+}
+
+static void StartWidgetSelectionAnim(HWND listHwnd, int selectedItemData) {
+    g_widgetSelectAnim.listHwnd = listHwnd;
+    g_widgetSelectAnim.selectedItemData = selectedItemData;
+    g_widgetSelectAnim.ticksTotal = motion::DurationToTicks(motion::Tokens::kNormalMs, kUiAnimIntervalMs);
+    g_widgetSelectAnim.ticksLeft = g_widgetSelectAnim.ticksTotal;
+    if (listHwnd) InvalidateRect(listHwnd, nullptr, FALSE);
+    EnsureUiAnimTimer();
+}
+
+static void TickUiAnimations() {
+    for (size_t i = 0; i < g_buttonPressAnims.size();) {
+        auto& a = g_buttonPressAnims[i];
+        if (!a.hwnd || !IsWindow(a.hwnd)) {
+            g_buttonPressAnims.erase(g_buttonPressAnims.begin() + i);
+            continue;
+        }
+        if (a.ticksLeft > 0) --a.ticksLeft;
+        InvalidateRect(a.hwnd, nullptr, FALSE);
+        if (a.ticksLeft == 0) {
+            g_buttonPressAnims.erase(g_buttonPressAnims.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+
+    if (g_widgetSelectAnim.ticksLeft > 0) {
+        --g_widgetSelectAnim.ticksLeft;
+        if (g_widgetSelectAnim.listHwnd && IsWindow(g_widgetSelectAnim.listHwnd)) {
+            InvalidateRect(g_widgetSelectAnim.listHwnd, nullptr, FALSE);
+        } else {
+            g_widgetSelectAnim.ticksLeft = 0;
+        }
+    }
+
+    StopUiAnimTimerIfIdle();
+}
+
 static bool IsWidgetVisible(const WidgetRow& row) {
     if (row.w.groupName.empty()) return row.w.alwaysVisible || g_showNonPinned;
     const int groupIndex = FindGroupIndexByName(row.w.groupName);
@@ -1188,19 +1500,24 @@ static LRESULT CALLBACK FloaterWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         const HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        if (g_brBtn) {
-            HBRUSH oldB = static_cast<HBRUSH>(SelectObject(hdc, g_brBtn));
-            Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-            SelectObject(hdc, oldB);
+        if (HRGN clip = CreateEllipticRgn(rc.left, rc.top, rc.right, rc.bottom)) {
+            SelectClipRgn(hdc, clip);
+            LuxGradientVertical(hdc, rc, LuxBlendRgb(kRgbEdit, kRgbLuxPanelTop, 0.55f), LuxBlendRgb(kRgbEdit, kRgbDeep0, 0.35f));
+            SelectClipRgn(hdc, nullptr);
+            DeleteObject(clip);
         }
         if (g_penGlow && g_penFrame) {
             HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
-            HPEN oldP = static_cast<HPEN>(SelectObject(hdc, g_penGlow));
+            HPEN rim = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, kRgbDeep0, 0.5f));
+            HPEN oldP = static_cast<HPEN>(SelectObject(hdc, rim));
+            Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(hdc, g_penGlow);
             Ellipse(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1);
             SelectObject(hdc, g_penFrame);
             Ellipse(hdc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
             SelectObject(hdc, oldP);
             SelectObject(hdc, oldBr);
+            DeleteObject(rim);
         }
         const int idx = static_cast<int>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
         std::string name = "Widget";
@@ -1265,20 +1582,28 @@ static LRESULT CALLBACK GroupFloaterWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
         const int idx = static_cast<int>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
         const bool isVisible = (idx >= 0 && idx < static_cast<int>(g_groups.size())) ? g_groups[idx].g.visible : false;
 
-        HBRUSH fill = CreateSolidBrush(isVisible ? RGB(20, 60, 30) : RGB(60, 20, 20));
-        HBRUSH oldB = static_cast<HBRUSH>(SelectObject(hdc, fill));
-        Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(hdc, oldB);
-        DeleteObject(fill);
+        const COLORREF fillLo = isVisible ? kRgbGroupOnFill : kRgbGroupOffFill;
+        const COLORREF fillHi =
+            isVisible ? LuxBlendRgb(kRgbGroupOnFill, RGB(90, 210, 140), 0.22f) : LuxBlendRgb(kRgbGroupOffFill, RGB(255, 130, 140), 0.18f);
+        if (HRGN clip = CreateEllipticRgn(rc.left, rc.top, rc.right, rc.bottom)) {
+            SelectClipRgn(hdc, clip);
+            LuxGradientVertical(hdc, rc, fillHi, fillLo);
+            SelectClipRgn(hdc, nullptr);
+            DeleteObject(clip);
+        }
 
         if (g_penGlow && g_penFrame) {
             HBRUSH oldBr = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
-            HPEN oldP = static_cast<HPEN>(SelectObject(hdc, g_penGlow));
+            HPEN rim = CreatePen(PS_SOLID, 1, LuxBlendRgb(kRgbNeonDim, fillLo, 0.35f));
+            HPEN oldP = static_cast<HPEN>(SelectObject(hdc, rim));
+            Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(hdc, g_penGlow);
             Ellipse(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1);
             SelectObject(hdc, g_penFrame);
             Ellipse(hdc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
             SelectObject(hdc, oldP);
             SelectObject(hdc, oldBr);
+            DeleteObject(rim);
         }
 
         std::string title = "Group";
@@ -1498,7 +1823,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_CTLCOLORSTATIC: {
         const HDC hdc = reinterpret_cast<HDC>(wParam);
+        const HWND ctl = reinterpret_cast<HWND>(lParam);
         SetBkMode(hdc, OPAQUE);
+        if (ctl == GetDlgItem(hWnd, IDC_STATIC_STATUS) && g_brStatus) {
+            SetBkColor(hdc, kRgbBgStatus);
+            SetTextColor(hdc, LuxBlendRgb(kRgbTextHi, kRgbNeonCyan, 0.12f));
+            return reinterpret_cast<LRESULT>(g_brStatus);
+        }
         SetBkColor(hdc, kRgbPanel);
         SetTextColor(hdc, kRgbTextHi);
         return reinterpret_cast<LRESULT>(g_brPanel);
@@ -1538,6 +1869,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
         const int code = HIWORD(wParam);
+        if (code == BN_CLICKED) {
+            const bool ownerDrawButton =
+                id == IDC_BTN_RUN || id == IDC_BTN_ADD || id == IDC_BTN_DELETE || id == IDC_BTN_SAVE ||
+                id == IDC_BTN_HIDE_NEXUS || id == IDC_BTN_ADD_GROUP || id == IDC_BTN_DELETE_GROUP;
+            if (ownerDrawButton) {
+                StartButtonPressAnim(GetDlgItem(hWnd, id));
+            }
+        }
 
         if (id == IDC_SHOW_NON_PINNED && code == BN_CLICKED) {
             SaveCurrentEditorWidget(hWnd);
@@ -1596,6 +1935,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (sel != LB_ERR) {
                 g_selectedModelIndex = static_cast<int>(SendMessageA(hList, LB_GETITEMDATA, sel, 0));
                 WriteWidgetToEditor(hWnd, g_selectedModelIndex);
+                StartWidgetSelectionAnim(hList, g_selectedModelIndex);
             } else {
                 g_selectedModelIndex = -1;
                 WriteWidgetToEditor(hWnd, -1);
@@ -1736,11 +2076,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             TickFloaterAnimations();
             return 0;
         }
+        if (wParam == IDT_UI_ANIM) {
+            TickUiAnimations();
+            return 0;
+        }
         break;
 
     case WM_DESTROY:
         TrayRemove();
         DestroyAllFloaters();
+        g_buttonPressAnims.clear();
+        g_widgetSelectAnim = ListSelectAnim{};
+        KillTimer(hWnd, IDT_UI_ANIM);
         ThemeDestroy();
         if (g_trayIcon) {
             DestroyIcon(g_trayIcon);
@@ -1763,6 +2110,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_hInstance = hInstance;
+    InitConfigPathBesideExe();
 
     const char CLASS_NAME[] = "WidgetLauncherWin32";
 

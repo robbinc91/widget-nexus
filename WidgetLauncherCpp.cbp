@@ -18,8 +18,10 @@
         </Compiler>
         <Linker>
           <Add option="-mwindows" />
+          <Add option="-static" />
           <Add library="comctl32" />
           <Add library="uxtheme" />
+          <Add library="msimg32" />
         </Linker>
       </Target>
       <Target title="Release">
@@ -33,8 +35,10 @@
         </Compiler>
         <Linker>
           <Add option="-mwindows" />
+          <Add option="-static" />
           <Add library="comctl32" />
           <Add library="uxtheme" />
+          <Add library="msimg32" />
         </Linker>
       </Target>
     </Build>

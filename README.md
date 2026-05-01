@@ -48,14 +48,16 @@ This app is **currently under development**—expect rough edges and changes. We
 2. Select **Debug** or **Release**.
 3. **Build** → **Build and run** (or **Rebuild** after pulling changes).
 
-Linker libraries used: **`comctl32`**, **`uxtheme`**.
+Linker libraries used: **`comctl32`**, **`uxtheme`**, **`msimg32`** (for `GradientFill` / luxury panel gradients).
+
+The project also passes **`-static`** to the linker so MinGW-w64 runtimes (including **`libwinpthread`**) are embedded in the `.exe`. Without that, Windows looks for **`libwinpthread-1.dll`** whenever MinGW’s `bin` folder is not on `PATH` (e.g. double‑clicking the program outside Code::Blocks).
 
 ### Command line (MinGW)
 
 From this directory:
 
 ```bash
-g++ -std=c++17 -Wall -O2 -mwindows main.cpp -lcomctl32 -luxtheme -o WidgetLauncherCpp.exe
+g++ -std=c++17 -Wall -O2 -mwindows -static main.cpp -lcomctl32 -luxtheme -lmsimg32 -o WidgetLauncherCpp.exe
 ```
 
 Place `widgets.txt` beside `WidgetLauncherCpp.exe` if you want the app to load/save config from the same folder as the binary.
@@ -105,6 +107,7 @@ command=wsl.exe -e bash -lc "ssh user@server"
 | `README.md` | This file. |
 | `LICENSE` | MIT license text. |
 | `docs/images/` | Screenshot assets referenced in this README. |
+| `linx-dst/` | **GTK 3** Linux/Ubuntu port (`CMake`). Same `widgets.txt` format; see `linx-dst/README.md`. |
 
 ---
 
