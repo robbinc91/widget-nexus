@@ -46,6 +46,14 @@
       <Add option="-std=c++17" />
     </Compiler>
     <Unit filename="main.cpp" />
+    <Unit filename="src-win/globals.cpp" />
+    <Unit filename="src-win/model.cpp" />
+    <Unit filename="src-win/dpi.cpp" />
+    <Unit filename="src-win/command_runner.cpp" />
+    <Unit filename="src-win/tray.cpp" />
+    <Unit filename="src-win/nexus_paint.cpp" />
+    <Unit filename="src-win/layout.cpp" />
+    <Unit filename="src-win/nexus_ui.cpp" />
     <Extensions>
       <code_completion />
       <debugger />

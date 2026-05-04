@@ -8,9 +8,9 @@ namespace motion {
 // Easing curves are documented for future non-linear tweening work.
 struct Tokens {
     // Durations (ms)
-    static constexpr unsigned int kFastMs = 90;    // press feedback
-    static constexpr unsigned int kNormalMs = 140; // hover/list transitions
-    static constexpr unsigned int kPanelMs = 160;  // panel open/close
+    static constexpr unsigned int kFastMs = 120;    // press feedback
+    static constexpr unsigned int kNormalMs = 180;  // hover/list transitions
+    static constexpr unsigned int kPanelMs = 240;   // panel open/close
 
     // Distances (px)
     static constexpr int kShiftSmallPx = 4;
