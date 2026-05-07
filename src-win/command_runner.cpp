@@ -30,101 +30,35 @@ bool PostRunStatus(HWND h, const std::string& msg) {
 } // namespace
 
 bool RunSingleCommand(const std::string& command, std::string& output, DWORD waitMs) {
-    auto toLower = [](std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return s;
-    };
-
-    const std::string cmdLower = toLower(command);
-    const bool interactive =
-        (cmdLower.find("wsl") != std::string::npos) ||
-        (cmdLower.find("ssh ") != std::string::npos) ||
-        (cmdLower.find("wt.exe") != std::string::npos);
-
-    if (interactive) {
-        STARTUPINFOA si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-
-        std::string cmdLine = "cmd.exe /K " + command;
-        std::vector<char> mutableCmd(cmdLine.begin(), cmdLine.end());
-        mutableCmd.push_back('\0');
-
-        const BOOL ok = CreateProcessA(
-            nullptr,
-            mutableCmd.data(),
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NEW_CONSOLE,
-            nullptr,
-            nullptr,
-            &si,
-            &pi);
-
-        if (!ok) {
-            output = "Failed to launch interactive terminal command.";
-            return false;
-        }
-
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        output = "Interactive command launched in new terminal window.";
-        return true;
-    }
-
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
+    (void)waitMs;
     STARTUPINFOA si{};
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
     PROCESS_INFORMATION pi{};
+    // Dedicated console per command; /C avoids leaving an extra idle wrapper shell.
     std::string cmdLine = "cmd.exe /C " + command;
     std::vector<char> mutableCmd(cmdLine.begin(), cmdLine.end());
     mutableCmd.push_back('\0');
 
-    const BOOL ok = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(hWrite);
+    const BOOL ok = CreateProcessA(
+        nullptr,
+        mutableCmd.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_CONSOLE,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
     if (!ok) {
-        CloseHandle(hRead);
+        output = "Failed to launch dedicated command console.";
         return false;
     }
 
-    const DWORD waitResult = (waitMs == INFINITE) ? WaitForSingleObject(pi.hProcess, INFINITE) : WaitForSingleObject(pi.hProcess, waitMs);
-    if (waitResult == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        CloseHandle(hRead);
-        output = "Command timed out.";
-        return false;
-    }
-
-    char buffer[4096];
-    DWORD bytesRead = 0;
-    output.clear();
-    while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, nullptr) && bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        output += buffer;
-        if (output.size() > 256 * 1024) break;
-    }
-
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    CloseHandle(hRead);
-    return exitCode == 0;
+    output = "Command launched in dedicated console window.";
+    return true;
 }
 
 bool CommandRunnerIsBusy() { return g_runBusy.load(std::memory_order_acquire); }
